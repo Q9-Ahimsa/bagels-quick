@@ -83,17 +83,31 @@ bq undo           # With confirmation
 bq undo -y        # Skip confirmation
 ```
 
-### Account Balances
+### Manage Accounts
 
 ```bash
-bq balance                        # Show all account balances with totals
+bq accs                                   # List all accounts
+
+# Create account
+bq accs add "Savings"                     # Create with 0 balance
+bq accs add "Cash" -d "Physical cash" -b 500   # With description and balance
+
+# Delete account (soft delete)
+bq accs delete savings
+bq accs delete "Old Account" -y           # Skip confirmation
 
 # Set balance to exact amount
-bq balance set debit 5000         # Set debit balance to exactly 5000
+bq accs set debit 5000                    # Set balance to exactly 5000
 
 # Adjust balance by relative amount
-bq balance adjust debit 100       # Add 100 to debit balance
-bq balance adjust debit -- -50    # Subtract 50 (use -- before negative numbers)
+bq accs adjust debit 100                  # Add 100 to balance
+bq accs adjust debit -- -50               # Subtract 50 (use -- before negative)
+```
+
+### View Balances
+
+```bash
+bq balance                                # Show all account balances with totals
 ```
 
 ### Configuration
@@ -115,10 +129,10 @@ bq config reset                          # Reset to defaults
 ### Reference Commands
 
 ```bash
-bq balance        # Show current account balances
+bq balance        # Show current account balances with totals
+bq accs           # List accounts (with starting balances)
 bq cats           # List categories (tree view)
 bq cats --flat    # List categories (flat table)
-bq accs           # List accounts (with starting balances)
 bq where          # Show database and config paths
 ```
 

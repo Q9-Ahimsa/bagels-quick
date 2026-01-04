@@ -444,36 +444,6 @@ def cats(flat: bool):
         conn.close()
 
 
-@cli.command()
-def accs():
-    """List available accounts."""
-    conn = get_connection()
-    try:
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            SELECT name, description, beginningBalance
-            FROM account
-            WHERE deletedAt IS NULL
-            ORDER BY id
-            """
-        )
-        accounts = cursor.fetchall()
-
-        table = Table(title="Accounts")
-        table.add_column("Name")
-        table.add_column("Description", style="dim")
-        table.add_column("Starting Balance", justify="right")
-
-        for name, desc, balance in accounts:
-            table.add_row(name, desc or "-", f"{balance:,.2f}")
-
-        console.print(table)
-
-    finally:
-        conn.close()
-
-
 def calculate_account_balance(conn: sqlite3.Connection, account_id: int, beginning_balance: float) -> float:
     """Calculate current balance for an account."""
     cursor = conn.cursor()
@@ -509,26 +479,31 @@ def calculate_account_balance(conn: sqlite3.Connection, account_id: int, beginni
     return beginning_balance + income - expenses - transfers_out + transfers_in
 
 
+# =============================================================================
+# Accounts Command Group
+# =============================================================================
+
 @cli.group(invoke_without_command=True)
 @click.pass_context
-def balance(ctx):
-    """Show and manage account balances.
+def accs(ctx):
+    """Manage accounts.
 
     \b
     EXAMPLES:
-      bq balance                              # Show all account balances
-      bq balance set debit 5000               # Set debit account balance to 5000
-      bq balance adjust debit 100             # Add 100 to debit balance
-      bq balance adjust debit -50             # Subtract 50 from debit balance
+      bq accs                              # List all accounts
+      bq accs add "Savings" -b 1000        # Create new account
+      bq accs delete savings               # Delete an account
+      bq accs set debit 5000               # Set balance to exact amount
+      bq accs adjust debit 100             # Adjust balance by amount
     """
     if ctx.invoked_subcommand is None:
-        # Default behavior: show balances
+        # Default behavior: list accounts
         conn = get_connection()
         try:
             cursor = conn.cursor()
             cursor.execute(
                 """
-                SELECT id, name, beginningBalance
+                SELECT name, description, beginningBalance
                 FROM account
                 WHERE deletedAt IS NULL
                 ORDER BY id
@@ -536,29 +511,13 @@ def balance(ctx):
             )
             accounts = cursor.fetchall()
 
-            table = Table(title="Account Balances")
-            table.add_column("Account")
-            table.add_column("Current Balance", justify="right")
-            table.add_column("Starting Balance", justify="right", style="dim")
+            table = Table(title="Accounts")
+            table.add_column("Name")
+            table.add_column("Description", style="dim")
+            table.add_column("Starting Balance", justify="right")
 
-            total = 0.0
-            for acc_id, name, beginning in accounts:
-                current = calculate_account_balance(conn, acc_id, beginning)
-                total += current
-
-                if current >= 0:
-                    bal_str = f"[green]{current:,.2f}[/green]"
-                else:
-                    bal_str = f"[red]{current:,.2f}[/red]"
-
-                table.add_row(name, bal_str, f"{beginning:,.2f}")
-
-            table.add_section()
-            if total >= 0:
-                total_str = f"[bold green]{total:,.2f}[/bold green]"
-            else:
-                total_str = f"[bold red]{total:,.2f}[/bold red]"
-            table.add_row("[bold]Total[/bold]", total_str, "")
+            for name, desc, balance in accounts:
+                table.add_row(name, desc or "-", f"{balance:,.2f}")
 
             console.print(table)
 
@@ -566,18 +525,108 @@ def balance(ctx):
             conn.close()
 
 
-@balance.command("set")
+@accs.command("add")
+@click.argument("name")
+@click.option("-d", "--desc", "--description", "description", help="Account description")
+@click.option("-b", "--balance", "starting_balance", type=float, default=0.0, help="Starting balance (default: 0)")
+def accs_add(name: str, description: str | None, starting_balance: float):
+    """Create a new account.
+
+    \b
+    EXAMPLES:
+      bq accs add "Savings"                    # Create with 0 balance
+      bq accs add "Credit Card" -b -500        # Create with negative balance
+      bq accs add "Cash" -d "Physical cash" -b 200
+    """
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+
+        # Check if account already exists
+        cursor.execute(
+            "SELECT id FROM account WHERE LOWER(name) = LOWER(?) AND deletedAt IS NULL",
+            (name,)
+        )
+        if cursor.fetchone():
+            raise click.ClickException(f"Account '{name}' already exists.")
+
+        now = datetime.now()
+        cursor.execute(
+            """
+            INSERT INTO account (createdAt, updatedAt, name, description, beginningBalance, hidden)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (now, now, name, description, starting_balance, False)
+        )
+        conn.commit()
+
+        console.print(f"[green]Created account:[/green] [bold]{name}[/bold]")
+        if starting_balance != 0:
+            console.print(f"Starting balance: {starting_balance:,.2f}")
+
+    finally:
+        conn.close()
+
+
+@accs.command("delete")
+@click.argument("account")
+@click.option("-y", "--yes", is_flag=True, help="Skip confirmation")
+def accs_delete(account: str, yes: bool):
+    """Delete an account (soft delete).
+
+    \b
+    EXAMPLES:
+      bq accs delete savings
+      bq accs delete "Old Account" -y    # Skip confirmation
+    """
+    conn = get_connection()
+    try:
+        acc_result = find_account(conn, account)
+        if not acc_result:
+            raise click.ClickException(f"Account '{account}' not found.")
+        acc_id, acc_name = acc_result
+
+        # Check if account has records
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT COUNT(*) FROM record WHERE accountId = ? OR transferToAccountId = ?",
+            (acc_id, acc_id)
+        )
+        record_count = cursor.fetchone()[0]
+
+        if record_count > 0:
+            console.print(f"[yellow]Warning:[/yellow] Account '{acc_name}' has {record_count} associated records.")
+
+        if not yes:
+            if not click.confirm(f"Delete account '{acc_name}'?"):
+                console.print("[dim]Cancelled.[/dim]")
+                return
+
+        # Soft delete
+        cursor.execute(
+            "UPDATE account SET deletedAt = ?, updatedAt = ? WHERE id = ?",
+            (datetime.now(), datetime.now(), acc_id)
+        )
+        conn.commit()
+
+        console.print(f"[green]Deleted account:[/green] {acc_name}")
+
+    finally:
+        conn.close()
+
+
+@accs.command("set")
 @click.argument("account")
 @click.argument("amount", type=float)
-def balance_set(account: str, amount: float):
+def accs_set(account: str, amount: float):
     """Set an account's balance to a specific amount.
 
     This adjusts the starting balance so current balance equals the target.
 
     \b
     EXAMPLES:
-      bq balance set debit 5000       # Set debit balance to exactly 5000
-      bq balance set savings 10000    # Set savings balance to 10000
+      bq accs set debit 5000       # Set debit balance to exactly 5000
+      bq accs set savings 10000    # Set savings balance to 10000
     """
     conn = get_connection()
     try:
@@ -596,8 +645,7 @@ def balance_set(account: str, amount: float):
         # Calculate current balance with old beginning
         current = calculate_account_balance(conn, acc_id, old_beginning)
 
-        # New beginning = target - (current - old_beginning)
-        # Which simplifies to: new_beginning = old_beginning + (target - current)
+        # New beginning = old_beginning + (target - current)
         new_beginning = old_beginning + (amount - current)
 
         cursor.execute(
@@ -613,18 +661,18 @@ def balance_set(account: str, amount: float):
         conn.close()
 
 
-@balance.command("adjust")
+@accs.command("adjust")
 @click.argument("account")
 @click.argument("amount", type=float)
-def balance_adjust(account: str, amount: float):
+def accs_adjust(account: str, amount: float):
     """Adjust an account's balance by a relative amount.
 
     Use positive to add, negative to subtract.
 
     \b
     EXAMPLES:
-      bq balance adjust debit 100     # Add 100 to debit balance
-      bq balance adjust debit -50     # Subtract 50 from debit balance
+      bq accs adjust debit 100     # Add 100 to debit balance
+      bq accs adjust debit -- -50  # Subtract 50 (use -- before negative)
     """
     conn = get_connection()
     try:
@@ -657,6 +705,52 @@ def balance_adjust(account: str, amount: float):
 
         console.print(f"[bold]{acc_name}[/bold] adjusted by {adj_str}")
         console.print(f"New balance: [bold]{new_current:,.2f}[/bold]")
+
+    finally:
+        conn.close()
+
+
+@cli.command()
+def balance():
+    """Show current account balances."""
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT id, name, beginningBalance
+            FROM account
+            WHERE deletedAt IS NULL
+            ORDER BY id
+            """
+        )
+        accounts = cursor.fetchall()
+
+        table = Table(title="Account Balances")
+        table.add_column("Account")
+        table.add_column("Current Balance", justify="right")
+        table.add_column("Starting Balance", justify="right", style="dim")
+
+        total = 0.0
+        for acc_id, name, beginning in accounts:
+            current = calculate_account_balance(conn, acc_id, beginning)
+            total += current
+
+            if current >= 0:
+                bal_str = f"[green]{current:,.2f}[/green]"
+            else:
+                bal_str = f"[red]{current:,.2f}[/red]"
+
+            table.add_row(name, bal_str, f"{beginning:,.2f}")
+
+        table.add_section()
+        if total >= 0:
+            total_str = f"[bold green]{total:,.2f}[/bold green]"
+        else:
+            total_str = f"[bold red]{total:,.2f}[/bold red]"
+        table.add_row("[bold]Total[/bold]", total_str, "")
+
+        console.print(table)
 
     finally:
         conn.close()
