@@ -1,0 +1,20 @@
+[project]
+name = "bagels-quick"
+version = "0.1.0"
+description = "Quick CLI companion for Bagels expense tracker"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "click>=8.3.1",
+    "rich>=14.2.0",
+]
+
+[project.scripts]
+bq = "bagels_quick.cli:cli"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bagels_quick"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
