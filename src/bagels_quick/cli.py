@@ -474,6 +474,194 @@ def accs():
         conn.close()
 
 
+def calculate_account_balance(conn: sqlite3.Connection, account_id: int, beginning_balance: float) -> float:
+    """Calculate current balance for an account."""
+    cursor = conn.cursor()
+
+    # Income (money in)
+    cursor.execute(
+        "SELECT COALESCE(SUM(amount), 0) FROM record WHERE accountId = ? AND isIncome = 1 AND isTransfer = 0",
+        (account_id,)
+    )
+    income = cursor.fetchone()[0]
+
+    # Expenses (money out)
+    cursor.execute(
+        "SELECT COALESCE(SUM(amount), 0) FROM record WHERE accountId = ? AND isIncome = 0 AND isTransfer = 0",
+        (account_id,)
+    )
+    expenses = cursor.fetchone()[0]
+
+    # Transfers out (money leaving this account)
+    cursor.execute(
+        "SELECT COALESCE(SUM(amount), 0) FROM record WHERE accountId = ? AND isTransfer = 1",
+        (account_id,)
+    )
+    transfers_out = cursor.fetchone()[0]
+
+    # Transfers in (money coming to this account)
+    cursor.execute(
+        "SELECT COALESCE(SUM(amount), 0) FROM record WHERE transferToAccountId = ?",
+        (account_id,)
+    )
+    transfers_in = cursor.fetchone()[0]
+
+    return beginning_balance + income - expenses - transfers_out + transfers_in
+
+
+@cli.group(invoke_without_command=True)
+@click.pass_context
+def balance(ctx):
+    """Show and manage account balances.
+
+    \b
+    EXAMPLES:
+      bq balance                              # Show all account balances
+      bq balance set debit 5000               # Set debit account balance to 5000
+      bq balance adjust debit 100             # Add 100 to debit balance
+      bq balance adjust debit -50             # Subtract 50 from debit balance
+    """
+    if ctx.invoked_subcommand is None:
+        # Default behavior: show balances
+        conn = get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT id, name, beginningBalance
+                FROM account
+                WHERE deletedAt IS NULL
+                ORDER BY id
+                """
+            )
+            accounts = cursor.fetchall()
+
+            table = Table(title="Account Balances")
+            table.add_column("Account")
+            table.add_column("Current Balance", justify="right")
+            table.add_column("Starting Balance", justify="right", style="dim")
+
+            total = 0.0
+            for acc_id, name, beginning in accounts:
+                current = calculate_account_balance(conn, acc_id, beginning)
+                total += current
+
+                if current >= 0:
+                    bal_str = f"[green]{current:,.2f}[/green]"
+                else:
+                    bal_str = f"[red]{current:,.2f}[/red]"
+
+                table.add_row(name, bal_str, f"{beginning:,.2f}")
+
+            table.add_section()
+            if total >= 0:
+                total_str = f"[bold green]{total:,.2f}[/bold green]"
+            else:
+                total_str = f"[bold red]{total:,.2f}[/bold red]"
+            table.add_row("[bold]Total[/bold]", total_str, "")
+
+            console.print(table)
+
+        finally:
+            conn.close()
+
+
+@balance.command("set")
+@click.argument("account")
+@click.argument("amount", type=float)
+def balance_set(account: str, amount: float):
+    """Set an account's balance to a specific amount.
+
+    This adjusts the starting balance so current balance equals the target.
+
+    \b
+    EXAMPLES:
+      bq balance set debit 5000       # Set debit balance to exactly 5000
+      bq balance set savings 10000    # Set savings balance to 10000
+    """
+    conn = get_connection()
+    try:
+        acc_result = find_account(conn, account)
+        if not acc_result:
+            raise click.ClickException(f"Account '{account}' not found. Run 'bq accs' to see available accounts.")
+        acc_id, acc_name = acc_result
+
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT beginningBalance FROM account WHERE id = ?",
+            (acc_id,)
+        )
+        old_beginning = cursor.fetchone()[0]
+
+        # Calculate current balance with old beginning
+        current = calculate_account_balance(conn, acc_id, old_beginning)
+
+        # New beginning = target - (current - old_beginning)
+        # Which simplifies to: new_beginning = old_beginning + (target - current)
+        new_beginning = old_beginning + (amount - current)
+
+        cursor.execute(
+            "UPDATE account SET beginningBalance = ?, updatedAt = ? WHERE id = ?",
+            (new_beginning, datetime.now(), acc_id)
+        )
+        conn.commit()
+
+        console.print(f"[bold]{acc_name}[/bold] balance set to [green]{amount:,.2f}[/green]")
+        console.print(f"[dim](Starting balance adjusted: {old_beginning:,.2f} -> {new_beginning:,.2f})[/dim]")
+
+    finally:
+        conn.close()
+
+
+@balance.command("adjust")
+@click.argument("account")
+@click.argument("amount", type=float)
+def balance_adjust(account: str, amount: float):
+    """Adjust an account's balance by a relative amount.
+
+    Use positive to add, negative to subtract.
+
+    \b
+    EXAMPLES:
+      bq balance adjust debit 100     # Add 100 to debit balance
+      bq balance adjust debit -50     # Subtract 50 from debit balance
+    """
+    conn = get_connection()
+    try:
+        acc_result = find_account(conn, account)
+        if not acc_result:
+            raise click.ClickException(f"Account '{account}' not found. Run 'bq accs' to see available accounts.")
+        acc_id, acc_name = acc_result
+
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT beginningBalance FROM account WHERE id = ?",
+            (acc_id,)
+        )
+        old_beginning = cursor.fetchone()[0]
+        new_beginning = old_beginning + amount
+
+        cursor.execute(
+            "UPDATE account SET beginningBalance = ?, updatedAt = ? WHERE id = ?",
+            (new_beginning, datetime.now(), acc_id)
+        )
+        conn.commit()
+
+        # Calculate new current balance
+        new_current = calculate_account_balance(conn, acc_id, new_beginning)
+
+        if amount >= 0:
+            adj_str = f"[green]+{amount:,.2f}[/green]"
+        else:
+            adj_str = f"[red]{amount:,.2f}[/red]"
+
+        console.print(f"[bold]{acc_name}[/bold] adjusted by {adj_str}")
+        console.print(f"New balance: [bold]{new_current:,.2f}[/bold]")
+
+    finally:
+        conn.close()
+
+
 @cli.command()
 def where():
     """Show where the Bagels database is located."""
